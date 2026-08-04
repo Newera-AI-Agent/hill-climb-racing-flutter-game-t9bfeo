@@ -21,7 +21,7 @@ class GameState {
     phase = GamePhase.playing;
     distance = 0.0;
     coins = 0;
-    fuel = config.startingFuel;
+    fuel = GameConfig.maxFuel;
     speed = 0.0;
     tilt = 0.0;
     isGrounded = true;
