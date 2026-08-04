@@ -5,6 +5,8 @@ import 'dart:ui' show Color;
 class GameConfig {
   GameConfig._();
 
+  static const String version = '0.1.0';
+
   // ── World ──
   static const double gravity = 15.0;
   static const double pixelsPerMeter = 50.0;
