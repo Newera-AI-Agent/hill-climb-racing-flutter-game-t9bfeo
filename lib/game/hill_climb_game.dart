@@ -5,6 +5,7 @@ import 'package:flame/components.dart';
 import 'package:flame/events.dart';
 import 'package:flame_forge2d/flame_forge2d.dart';
 import 'package:flutter/material.dart' hide Overlay, Draggable, Image;
+import 'package:flutter/services.dart';
 
 import 'game_config.dart';
 import 'game_state.dart';

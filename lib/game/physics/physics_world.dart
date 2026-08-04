@@ -110,7 +110,31 @@ class PhysicsWorld {
 
   /// Advance the physics simulation by one step.
   void step(double dt) {
-    world.stepDt(dt);
+    world.world.stepDt(dt);
+  }
+
+  // ── Vehicle management ──
+
+  /// The active vehicle body component, or null if not yet created.
+  VehicleBody? vehicle;
+
+  /// Create the vehicle at the given world position.
+  void createVehicle(Vector2 position) {
+    vehicle = VehicleBody(
+      position: position,
+    );
+    world.add(vehicle!);
+  }
+
+  // ── Terrain management ──
+
+  /// Add a terrain body built from the given points.
+  TerrainBody addTerrain(List<Vector2> points, double startX) {
+    final endX = points.isNotEmpty ? points.last.x : startX + GameConfig.chunkWidth;
+    final terrain = TerrainBody(points, startX, endX);
+    world.add(terrain);
+    terrainBodies.add(terrain.body);
+    return terrain;
   }
 
   /// Destroy all managed bodies.
