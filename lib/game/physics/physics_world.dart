@@ -1,131 +1,124 @@
+import 'dart:math' as math;
+
 import 'package:flame_forge2d/flame_forge2d.dart';
 import '../game_config.dart';
-import 'vehicle_body.dart';
-import 'terrain_body.dart';
-import 'contact_listener.dart';
 
-/// Manages the Forge2D physics world — gravity, vehicle, terrain, and coin/fuel bodies.
+/// Manages the Forge2D physics world — gravity, vehicle, terrain, and pickups.
 class PhysicsWorld {
-  final Forge2DGame game;
-  late final World world;
-  late final VehicleBody vehicle;
-  final List<TerrainBody> terrainBodies = [];
-  final List<Body> pickupBodies = [];
-  final GameContactListener contactListener;
+  final Forge2DWorld world;
+  
+  /// All terrain bodies currently in the world.
+  final List<Body> terrainBodies = [];
+  
+  /// All coin pickup bodies currently in the world.
+  final List<Body> coinBodies = [];
+  
+  /// All fuel pickup bodies currently in the world.
+  final List<Body> fuelBodies = [];
 
-  /// Track which pickups have been collected this frame.
-  final Set<Body> collectedPickups = {};
+  PhysicsWorld(this.world);
 
-  PhysicsWorld(this.game)
-      : contactListener = GameContactListener() {
-    world = World.withGravity(Vector2(0, GameConfig.gravity));
-    world.setContactListener(contactListener);
+  /// Create a terrain chain body from a list of world-space points.
+  Body createTerrain(List<Vector2> points) {
+    final bodyDef = BodyDef(type: BodyType.static, position: Vector2.zero());
+    final body = world.createBody(bodyDef);
+    
+    for (int i = 0; i < points.length - 1; i++) {
+      final shape = EdgeShape()
+        ..set(points[i], points[i + 1]);
+      final fixtureDef = FixtureDef(shape)
+        ..friction = 0.6
+        ..restitution = 0.05;
+      body.createFixture(fixtureDef);
+    }
+    
+    terrainBodies.add(body);
+    return body;
   }
 
-  /// Create the vehicle at the given world position.
-  void createVehicle(Vector2 position) {
-    vehicle = VehicleBody(
-      world: world,
-      position: position,
-    );
-    world.add(vehicle);
-  }
-
-  /// Add a terrain segment as a chain shape body.
-  void addTerrainSegment(List<Vector2> points, double startX) {
-    final terrain = TerrainBody(
-      world: world,
-      points: points,
-      startX: startX,
-    );
-    world.add(terrain);
-    terrainBodies.add(terrain);
-  }
-
-  /// Remove terrain bodies that are far behind the camera.
+  /// Remove terrain bodies whose rightmost X is behind the camera.
   void cullTerrain(double minX) {
-    terrainBodies.removeWhere((t) {
-      if (t.startX + t.segmentWidth < minX - GameConfig.chunkWidth) {
-        t.removeFromParent();
-        world.destroyBody(t.body);
+    terrainBodies.removeWhere((body) {
+      // Check if all fixtures are behind minX.
+      bool allBehind = true;
+      for (final fixture in body.fixtures) {
+        if (fixture.shape is EdgeShape) {
+          final edge = fixture.shape as EdgeShape;
+          if (edge.vertex2.x >= minX) {
+            allBehind = false;
+            break;
+          }
+        }
+      }
+      if (allBehind) {
+        world.destroyBody(body);
         return true;
       }
       return false;
     });
   }
 
-  /// Add a coin pickup at the given world position.
-  void addCoin(Vector2 position) {
-    final bodyDef = BodyDef(
-      type: BodyType.static,
-      position: position,
-    );
+  /// Create a coin pickup sensor at the given position.
+  Body createCoin(Vector2 position) {
+    final bodyDef = BodyDef(type: BodyType.static, position: position);
     final body = world.createBody(bodyDef);
     final shape = CircleShape()..radius = GameConfig.pickupRadius;
     final fixtureDef = FixtureDef(shape)
       ..isSensor = true
-      ..userData = PickupType.coin;
+      ..userData = 'coin';
     body.createFixture(fixtureDef);
-    pickupBodies.add(body);
+    coinBodies.add(body);
+    return body;
   }
 
-  /// Add a fuel pickup at the given world position.
-  void addFuel(Vector2 position) {
-    final bodyDef = BodyDef(
-      type: BodyType.static,
-      position: position,
-    );
+  /// Create a fuel pickup sensor at the given position.
+  Body createFuel(Vector2 position) {
+    final bodyDef = BodyDef(type: BodyType.static, position: position);
     final body = world.createBody(bodyDef);
     final shape = CircleShape()..radius = GameConfig.pickupRadius;
     final fixtureDef = FixtureDef(shape)
       ..isSensor = true
-      ..userData = PickupType.fuel;
+      ..userData = 'fuel';
     body.createFixture(fixtureDef);
-    pickupBodies.add(body);
+    fuelBodies.add(body);
+    return body;
   }
 
-  /// Remove a collected pickup body.
-  void removePickup(Body body) {
-    pickupBodies.remove(body);
+  /// Remove a specific coin body from the world.
+  void removeCoin(Body body) {
+    coinBodies.remove(body);
     world.destroyBody(body);
   }
 
-  /// Collect all pickups marked by the contact listener this frame.
-  List<(Body, PickupType)> drainCollectedPickups() {
-    final result = contactListener.drainCollected(this);
-    for (final (body, _) in result) {
-      pickupBodies.remove(body);
+  /// Remove a specific fuel body from the world.
+  void removeFuel(Body body) {
+    fuelBodies.remove(body);
+    world.destroyBody(body);
+  }
+
+  /// Remove all pickup bodies.
+  void clearAllPickups() {
+    for (final body in [...coinBodies]) {
       world.destroyBody(body);
     }
-    return result;
-  }
-
-  /// Apply motor torque to the rear wheel.
-  void applyMotorTorque(double torque) {
-    vehicle.rearWheel?.applyAngularImpulse(torque);
-  }
-
-  /// Apply motor torque to the front wheel.
-  void applyFrontMotorTorque(double torque) {
-    vehicle.frontWheel?.applyAngularImpulse(torque);
+    coinBodies.clear();
+    for (final body in [...fuelBodies]) {
+      world.destroyBody(body);
+    }
+    fuelBodies.clear();
   }
 
   /// Advance the physics simulation by one step.
   void step(double dt) {
-    world.stepDt(dt, velocityIterations: 8, positionIterations: 3);
+    world.stepDt(dt);
   }
 
-  /// Clean up all bodies.
+  /// Destroy all managed bodies.
   void dispose() {
-    for (final t in List<TerrainBody>.from(terrainBodies)) {
-      t.removeFromParent();
-      world.destroyBody(t.body);
+    clearAllPickups();
+    for (final body in [...terrainBodies]) {
+      world.destroyBody(body);
     }
     terrainBodies.clear();
-    for (final b in List<Body>.from(pickupBodies)) {
-      world.destroyBody(b);
-    }
-    pickupBodies.clear();
-    vehicle.removeFromParent();
   }
 }

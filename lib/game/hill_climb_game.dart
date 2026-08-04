@@ -1,297 +1,254 @@
-import 'dart:async';
 import 'dart:math' as math;
+
 import 'package:flame/game.dart';
 import 'package:flame/components.dart';
 import 'package:flame/events.dart';
 import 'package:flame_forge2d/flame_forge2d.dart';
-import 'package:flutter/material.dart' hide Overlay;
+import 'package:flutter/material.dart' hide Overlay, Draggable, Image;
+
 import 'game_config.dart';
 import 'game_state.dart';
-import 'game_commands.dart';
 import 'physics/physics_world.dart';
-import 'physics/vehicle_body.dart';
-import 'terrain/terrain_streamer.dart';
-import 'entities/coin_component.dart';
-import 'entities/fuel_component.dart';
-import 'camera/follow_camera.dart';
-import 'overlays/hud_overlay.dart';
-import 'overlays/pause_overlay.dart';
-import 'overlays/game_over_overlay.dart';
 
-/// Main game class that ties physics, terrain, entities, camera and UI together.
-class HillClimbGame extends Forge2DGame
-    with KeyboardEvents, PanDetector, TapDetector {
+/// Hill Climb Racing — main game class.
+/// Manages physics, input, state, and rendering.
+class HillClimbGame extends Forge2DGame with KeyboardEvents {
   late final PhysicsWorld physicsWorld;
-  late final TerrainStreamer terrainStreamer;
-  late final VehicleBody vehicle;
-  late final FollowCamera followCamera;
   late final GameState gameState;
+  final Set<LogicalKeyboardKey> _keysHeld = {};
 
-  // Command stream for decoupling input from updates.
-  final _commandController = StreamController<GameCommand>.broadcast();
-  Stream<GameCommand> get commands => _commandController.stream;
-
-  // Track which keys are held down.
-  final _keysHeld = <LogicalKeyboardKey>{};
-
-  HillClimbGame() : super(gravity: GameConfig.worldGravity, zoom: 10.0);
+  HillClimbGame() : super(gravity: GameConfig.gravity, zoom: 10.0);
 
   @override
   Future<void> onLoad() async {
     await super.onLoad();
 
-    // Set up the camera.
-    followCamera = FollowCamera(
-      viewport: camera.viewport,
-      offset: Vector2.zero(),
-    );
-    camera.viewport.add(followCamera);
-
-    // Create game state.
-    gameState = GameState();
-    gameState.addListener(_onGameStateChanged);
-
-    // Create physics world and terrain.
+    gameState = GameState(config: GameConfig());
     physicsWorld = PhysicsWorld();
-    terrainStreamer = TerrainStreamer(world: world);
 
-    // Create vehicle.
-    vehicle = VehicleBody(
-      world: world,
-      startPosition: Vector2(0, 0),
-    );
-    world.add(vehicle);
+    // Center camera slightly above vehicle start position.
+    camera.viewport.anchor = Anchor.center;
+    camera.followVector2(Vector2.zero(), relativeOffset: const Offset(0, 0));
 
-    // Set up contact listener for pickups.
-    world.contactManager.contactListener = ContactListener(
-      onCoinCollected: _onCoinCollected,
-      onFuelCollected: _onFuelCollected,
-    );
+    // Create terrain chunks ahead of start.
+    _generateTerrainAround(0);
 
-    // Load overlays into the Forge2D world overlay system.
-    overlays.addEntry('hud', HudOverlay(game: this));
-    overlays.addEntry('pause', PauseOverlay(game: this));
-    overlays.addEntry('gameOver', GameOverOverlay(game: this));
-    overlays.active = 'hud';
+    // Spawn vehicle.
+    _spawnVehicle();
 
-    // Start the game loop.
-    gameState.startGame();
+    // Start game loop.
+    gameState.phase = GamePhase.playing;
+  }
 
-    // Spawn initial terrain and pickups.
-    terrainStreamer.generateInitialChunks(vehicle.body.position);
+  void _spawnVehicle() {
+    physicsWorld.createVehicle(Vector2(3, GameConfig.minTerrainY - 3));
+    final vehicleBody = physicsWorld.vehicle;
+    if (vehicleBody != null) {
+      world.add(vehicleBody);
+    }
+  }
+
+  void _generateTerrainAround(double centerX) {
+    final chunkWidth = GameConfig.chunkWidth;
+    final chunkIndex = (centerX / chunkWidth).floor();
+
+    for (int i = chunkIndex - GameConfig.chunksBehind;
+        i <= chunkIndex + GameConfig.chunksAhead;
+        i++) {
+      if (!_hasTerrainForChunk(i)) {
+        _createTerrainChunk(i);
+      }
+    }
+  }
+
+  final Set<int> _generatedChunks = {};
+
+  bool _hasTerrainForChunk(int index) => _generatedChunks.contains(index);
+
+  void _createTerrainChunk(int chunkIndex) {
+    final chunkWidth = GameConfig.chunkWidth;
+    final startX = chunkIndex * chunkWidth;
+    final rng = math.Random(GameConfig.terrainSeed + chunkIndex * 31);
+
+    // Generate terrain points for this chunk using Perlin-like noise.
+    final points = <Vector2>[];
+    final segmentLength = GameConfig.terrainSegmentLength;
+    final numSegments = (chunkWidth / segmentLength).ceil();
+
+    for (int i = 0; i <= numSegments; i++) {
+      final x = startX + i * segmentLength;
+
+      // Multi-octave noise for terrain height.
+      double y = GameConfig.minTerrainY +
+          (GameConfig.maxTerrainY - GameConfig.minTerrainY) / 2;
+
+      // Smooth hills using sine combination.
+      y += math.sin(x * 0.05 + rng.nextDouble() * 0.5) * 3.0;
+      y += math.sin(x * 0.12 + rng.nextDouble() * 2.0) * 2.0;
+      y += math.sin(x * 0.3 + rng.nextDouble() * 4.0) * 1.5;
+
+      // Add some random variation.
+      y += (rng.nextDouble() - 0.5) * 2.0;
+
+      // Clamp to valid range.
+      y = y.clamp(GameConfig.minTerrainY, GameConfig.maxTerrainY);
+
+      points.add(Vector2(x, y));
+    }
+
+    physicsWorld.addTerrain(points, startX);
+    _generatedChunks.add(chunkIndex);
+  }
+
+  void _cullTerrainBehind(double minX) {
+    physicsWorld.cullTerrain(minX);
+    _generatedChunks.removeWhere((index) {
+      final chunkEnd = (index + 1) * GameConfig.chunkWidth;
+      return chunkEnd < minX - 50;
+    });
   }
 
   @override
   void update(double dt) {
-    if (gameState.status != GameStatus.playing) {
-      super.update(dt);
-      return;
-    }
-
     super.update(dt);
 
-    // Update game state time.
-    gameState.elapsedTime += dt;
+    if (gameState.phase != GamePhase.playing) return;
 
-    // Calculate distance score.
-    final dist = vehicle.body.position.x - GameConfig.startX;
+    final vehicle = physicsWorld.vehicle;
+    if (vehicle == null || vehicle.body == null) return;
+
+    final vehicleBody = vehicle.body!;
+
+    // Update speed.
+    final vel = vehicleBody.linearVelocity;
+    gameState.speed = vel.x;
+
+    // Update distance.
+    final dist = vehicleBody.position.x;
     if (dist > gameState.distance) {
       gameState.distance = dist;
     }
 
     // Fuel consumption.
-    gameState.fuel -= GameConfig.fuelConsumptionRate * dt;
-    if (gameState.fuel <= 0) {
-      gameState.fuel = 0;
-      _triggerGameOver();
+    final isAccelerating =
+        _keysHeld.contains(LogicalKeyboardKey.arrowRight) ||
+        _keysHeld.contains(LogicalKeyboardKey.keyD);
+    if (isAccelerating) {
+      gameState.fuel -= GameConfig.fuelBurnRate * dt;
+      if (gameState.fuel <= 0) {
+        gameState.fuel = 0;
+        gameState.phase = GamePhase.gameOver;
+        return;
+      }
+    }
+
+    // Flip check.
+    final angle = vehicleBody.angle % (2 * math.pi);
+    if (angle > math.pi * 0.7 && angle < math.pi * 1.3) {
+      gameState.isFlipped = true;
+      gameState.phase = GamePhase.gameOver;
       return;
     }
 
-    // Flip check — if vehicle is upside down.
-    if (_isVehicleFlipped()) {
-      _triggerGameOver();
-      return;
-    }
+    // Apply vehicle controls.
+    _applyControls(dt);
 
     // Stream terrain ahead.
-    terrainStreamer.streamAround(vehicle.body.position);
+    _generateTerrainAround(vehicleBody.position.x);
+    _cullTerrainBehind(vehicleBody.position.x - 40);
 
-    // Spawn pickups ahead.
-    _maybeSpawnPickups();
+    // Smooth camera follow.
+    final target = Vector2(
+      vehicleBody.position.x + GameConfig.cameraLookAhead,
+      vehicleBody.position.y - GameConfig.cameraVerticalOffset,
+    );
+    camera.viewfinder.position = camera.viewfinder.position +
+        (target - camera.viewfinder.position) *
+            (GameConfig.cameraSmoothSpeed * dt);
+  }
 
-    // Update camera to follow vehicle.
-    followCamera.followTarget = vehicle.body.position;
+  void _applyControls(double dt) {
+    final vehicle = physicsWorld.vehicle;
+    if (vehicle == null) return;
+
+    final isRight = _keysHeld.contains(LogicalKeyboardKey.arrowRight) ||
+        _keysHeld.contains(LogicalKeyboardKey.keyD);
+    final isLeft = _keysHeld.contains(LogicalKeyboardKey.arrowLeft) ||
+        _keysHeld.contains(LogicalKeyboardKey.keyA);
+
+    if (isRight) {
+      vehicle.applyMotorSpeed(-GameConfig.acceleration);
+    } else if (isLeft) {
+      vehicle.applyMotorSpeed(GameConfig.brakeForce);
+    } else {
+      vehicle.applyMotorSpeed(0);
+    }
+
+    final isUp = _keysHeld.contains(LogicalKeyboardKey.arrowUp) ||
+        _keysHeld.contains(LogicalKeyboardKey.keyW);
+    final isDown = _keysHeld.contains(LogicalKeyboardKey.arrowDown) ||
+        _keysHeld.contains(LogicalKeyboardKey.keyS);
+
+    if (isUp) {
+      vehicle.applyTilt(-GameConfig.airTiltTorque);
+    } else if (isDown) {
+      vehicle.applyTilt(GameConfig.airTiltTorque);
+    }
   }
 
   @override
   void onKeyEvent(RawKeyEvent event, Set<LogicalKeyboardKey> keysPressed) {
     super.onKeyEvent(event, keysPressed);
+    _keysHeld.clear();
+    _keysHeld.addAll(keysPressed);
 
     if (event is RawKeyDownEvent) {
-      _keysHeld.add(event.logicalKey);
-
       if (event.logicalKey == LogicalKeyboardKey.escape ||
           event.logicalKey == LogicalKeyboardKey.keyP) {
-        _togglePause();
-        return;
+        if (gameState.phase == GamePhase.playing) {
+          gameState.phase = GamePhase.paused;
+        } else if (gameState.phase == GamePhase.paused) {
+          gameState.phase = GamePhase.playing;
+        }
       }
 
-      if (event.logicalKey == LogicalKeyboardKey.keyR) {
+      if (event.logicalKey == LogicalKeyboardKey.keyR &&
+          gameState.phase == GamePhase.gameOver) {
         _restart();
-        return;
       }
-    } else if (event is RawKeyUpEvent) {
-      _keysHeld.remove(event.logicalKey);
-    }
-
-    // Send continuous input based on held keys.
-    if (_keysHeld.contains(LogicalKeyboardKey.arrowRight) ||
-        _keysHeld.contains(LogicalKeyboardKey.keyD)) {
-      _commandController.add(GameCommand.accelerate);
-    } else if (_keysHeld.contains(LogicalKeyboardKey.arrowLeft) ||
-        _keysHeld.contains(LogicalKeyboardKey.keyA)) {
-      _commandController.add(GameCommand.brake);
-    }
-
-    if (_keysHeld.contains(LogicalKeyboardKey.arrowUp) ||
-        _keysHeld.contains(LogicalKeyboardKey.keyW)) {
-      _commandController.add(GameCommand.tiltBackward);
-    } else if (_keysHeld.contains(LogicalKeyboardKey.arrowDown) ||
-        _keysHeld.contains(LogicalKeyboardKey.keyS)) {
-      _commandController.add(GameCommand.tiltForward);
-    }
-  }
-
-  // Touch controls — tap right half = accelerate, left half = brake.
-  @override
-  void onPanUpdate(DragUpdateInfo info) {
-    if (gameState.status != GameStatus.playing) return;
-
-    final screenCenter = size.x / 2;
-    if (info.eventPosition.game.x > screenCenter) {
-      _commandController.add(GameCommand.accelerate);
-    } else {
-      _commandController.add(GameCommand.brake);
-    }
-  }
-
-  @override
-  void onPanEnd(DragEndInfo info) {
-    // Automatically tilts based on vehicle momentum — no tilt on pan end.
-  }
-
-  @override
-  void onTapDown(TapDownInfo info) {
-    if (gameState.status == GameStatus.paused) {
-      _togglePause();
-    } else if (gameState.status == GameStatus.gameOver) {
-      _restart();
-    }
-  }
-
-  void _onGameStateChanged() {
-    // Update overlays based on state.
-    switch (gameState.status) {
-      case GameStatus.playing:
-        overlays.active = 'hud';
-        break;
-      case GameStatus.paused:
-        overlays.active = 'pause';
-        break;
-      case GameStatus.gameOver:
-        overlays.active = 'gameOver';
-        break;
-    }
-  }
-
-  void _togglePause() {
-    if (gameState.status == GameStatus.playing) {
-      gameState.pause();
-    } else if (gameState.status == GameStatus.paused) {
-      gameState.resume();
     }
   }
 
   void _restart() {
-    gameState.restart();
-    vehicle.reset(Vector2(0, 0));
-    terrainStreamer.clearAll();
-    terrainStreamer.generateInitialChunks(Vector2(0, 0));
-    _clearAllPickups();
-  }
-
-  void _triggerGameOver() {
-    if (gameState.status == GameStatus.playing) {
-      gameState.gameOver();
-    }
-  }
-
-  bool _isVehicleFlipped() {
-    final angle = vehicle.body.angle;
-    // Normalize angle to [-pi, pi].
-    final normAngle = angle % (2 * math.pi);
-    return normAngle > math.pi / 2 && normAngle < 3 * math.pi / 2;
-  }
-
-  void _onCoinCollected() {
-    gameState.coins += 1;
-  }
-
-  void _onFuelCollected() {
-    gameState.fuel = (gameState.fuel + GameConfig.fuelPickupAmount)
-        .clamp(0, GameConfig.maxFuel);
-  }
-
-  final Set<int> _spawnedChunkIndices = {};
-
-  void _maybeSpawnPickups() {
-    final currentChunk = terrainStreamer.chunkIndexAt(vehicle.body.position.x);
-    if (!_spawnedChunkIndices.contains(currentChunk)) {
-      _spawnedChunkIndices.add(currentChunk);
-      _spawnPickupsForChunk(currentChunk);
-    }
-  }
-
-  void _spawnPickupsForChunk(int chunkIndex) {
-    final rng = math.Random(chunkIndex * 31 + GameConfig.terrainSeed);
-    final chunkStartX = chunkIndex * GameConfig.chunkWidth.toDouble();
-
-    // Coins.
-    final coinCount = rng.nextInt(4);
-    for (int i = 0; i < coinCount; i++) {
-      final x = chunkStartX + rng.nextDouble() * GameConfig.chunkWidth;
-      final y = terrainStreamer.getHeightAt(x) - 2.0 - rng.nextDouble() * 3.0;
-      final coin = CoinComponent(
-        position: Vector2(x, y),
-      );
-      world.add(coin);
+    // Destroy old vehicle.
+    if (physicsWorld.vehicle != null) {
+      physicsWorld.vehicle!.removeFromParent();
     }
 
-    // Fuel can.
-    if (rng.nextDouble() < 0.4) {
-      final x = chunkStartX + rng.nextDouble() * GameConfig.chunkWidth;
-      final y = terrainStreamer.getHeightAt(x) - 2.0;
-      final fuel = FuelComponent(
-        position: Vector2(x, y),
-      );
-      world.add(fuel);
-    }
+    // Clear terrain.
+    physicsWorld.dispose();
+    _generatedChunks.clear();
+
+    // Reset state.
+    gameState.reset();
+
+    // Re-create everything.
+    _generateTerrainAround(0);
+    _spawnVehicle();
   }
 
-  void _clearAllPickups() {
-    _spawnedChunkIndices.clear();
-    // Remove all coin and fuel bodies from world.
-    for (final body in world.bodies.toList()) {
-      if (body is CoinComponent || body is FuelComponent) {
-        world.destroyBody(body.body);
-      }
-    }
+  // Touch controls for mobile/web.
+  void onTapRight() {
+    if (gameState.phase != GamePhase.playing) return;
+    physicsWorld.vehicle?.applyMotorSpeed(-GameConfig.acceleration);
   }
 
-  @override
-  Color backgroundColor() => GameConfig.skyColor;
+  void onTapLeft() {
+    if (gameState.phase != GamePhase.playing) return;
+    physicsWorld.vehicle?.applyMotorSpeed(GameConfig.brakeForce);
+  }
 
-  void sendCommand(GameCommand command) {
-    _commandController.add(command);
+  void onTapRelease() {
+    physicsWorld.vehicle?.applyMotorSpeed(0);
   }
 }
